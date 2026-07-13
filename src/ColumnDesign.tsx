@@ -1,24 +1,30 @@
 import React, { useState, useEffect, useMemo } from 'react';
 
-// Default values to use for initial state and reset
+// SP 16 Chart Mapping Data
+const CHART_DATA: Record<number, Record<string, { chart: number, page: number }>> = {
+  250: { '0.05': { chart: 27, page: 112 }, '0.1': { chart: 28, page: 113 }, '0.15': { chart: 29, page: 114 }, '0.2': { chart: 30, page: 115 } },
+  415: { '0.05': { chart: 31, page: 116 }, '0.1': { chart: 32, page: 117 }, '0.15': { chart: 33, page: 118 }, '0.2': { chart: 34, page: 119 } },
+  500: { '0.05': { chart: 35, page: 120 }, '0.1': { chart: 36, page: 121 }, '0.15': { chart: 37, page: 122 }, '0.2': { chart: 38, page: 123 } },
+};
+
+// Default values
 const DEFAULT_INPUTS = {
-  Pu: '2750', 
-  Mu: '120', 
+  Pu: '5000', // Updated based on your recent screenshot
+  Mu: '150',  // Updated based on your recent screenshot
   b: '230', 
   D: '750', 
   L: '3.0',
   fck: 25, 
   fy: 500, 
-  ptFck: '0.05'
+  cover: '52.5', // New Input for Effective Cover (d')
+  ptFck: '0.06'
 };
 
-// Default bars state
 const DEFAULT_BARS: Record<string, number> = {
   '8': 0, '10': 0, '12': 0, '16': 0, '20': 0, '25': 0, '32': 0
 };
 
 export default function RectangularColumnTool() {
-  // LocalStorage initialization
   const [inputs, setInputs] = useState(() => {
     const saved = localStorage.getItem('col_inputs');
     return saved ? JSON.parse(saved) : DEFAULT_INPUTS;
@@ -29,7 +35,6 @@ export default function RectangularColumnTool() {
     return saved ? JSON.parse(saved) : DEFAULT_BARS;
   });
 
-  // Save to LocalStorage whenever inputs or bars change
   useEffect(() => {
     localStorage.setItem('col_inputs', JSON.stringify(inputs));
   }, [inputs]);
@@ -51,24 +56,7 @@ export default function RectangularColumnTool() {
     }
   };
 
-  const handleShare = async () => {
-    const shareText = `Column Design Report:\nLoad (Pu): ${inputs.Pu} kN\nMoment (Mu): ${inputs.Mu} kNm\nSize: ${inputs.b}x${inputs.D}mm\nChart Value (pt/fck): ${inputs.ptFck}\nPu/(fck b D): ${calc.axialRatio}\nMu/(fck b D²): ${calc.momentRatio}\nAst Req: ${calc.astRequired.toFixed(2)} sqmm\nAst Prov: ${calc.astProvided.toFixed(2)} sqmm\nStatus: ${calc.isSafe ? 'OK' : 'Revise'}`;
-    
-    if (navigator.share) {
-      try {
-        await navigator.share({
-          title: 'Uniq Designs - Column Report',
-          text: shareText,
-        });
-      } catch (error) {
-        console.log('Error sharing:', error);
-      }
-    } else {
-      alert("Sharing is not supported on this browser. You can print/save as PDF instead.");
-    }
-  };
-
-  // --- USEMEMO FOR LAG-FREE CALCULATIONS ---
+  // --- USEMEMO FOR CALCULATIONS & EXCEL LOGIC ---
   const calc = useMemo(() => {
     const n = {
       Pu: parseFloat(inputs.Pu) || 0,
@@ -76,6 +64,7 @@ export default function RectangularColumnTool() {
       b: parseFloat(inputs.b) || 0,
       D: parseFloat(inputs.D) || 0,
       L: parseFloat(inputs.L) || 0,
+      cover: parseFloat(inputs.cover) || 0,
       ptFck: parseFloat(inputs.ptFck) || 0,
       fck: inputs.fck,
       fy: inputs.fy
@@ -85,7 +74,7 @@ export default function RectangularColumnTool() {
     const mu_Nmm = n.Mu * 1000000;
     const L_mm = n.L * 1000;
 
-    // Eccentricity
+    // Minimum Eccentricity
     const ex = Math.max((L_mm / 500) + (n.D / 30), 20);
     const ey = Math.max((L_mm / 500) + (n.b / 30), 20);
 
@@ -95,6 +84,21 @@ export default function RectangularColumnTool() {
     
     const axialRatio = axialRatioRaw.toFixed(2);
     const momentRatio = momentRatioRaw.toFixed(2);
+
+    // --- YOUR EXCEL LOGIC FOR d'/D ---
+    // =IF(cover/D <= 0.05, 0.05, IF(cover/D <= 0.1, 0.1, IF(cover/D <= 0.15, 0.15, 0.2)))
+    const rawRatio = n.D > 0 ? (n.cover / n.D) : 0;
+    let dDashD = '0.05';
+    if (rawRatio <= 0.05) dDashD = '0.05';
+    else if (rawRatio <= 0.10) dDashD = '0.1';
+    else if (rawRatio <= 0.15) dDashD = '0.15';
+    else dDashD = '0.2';
+
+    // Chart Text Generation
+    const currentChart = CHART_DATA[n.fy]?.[dDashD];
+    const chartText = currentChart 
+      ? `Refer Chart ${currentChart.chart} of SP 16, Page no: ${currentChart.page}` 
+      : "Chart details not available";
 
     // Required Steel
     const pt = n.ptFck * n.fck;
@@ -111,8 +115,20 @@ export default function RectangularColumnTool() {
 
     const isSafe = astProvided >= astRequired;
 
-    return { ex, ey, axialRatio, momentRatio, pt, astRequired, astProvided, isSafe };
+    return { ex, ey, axialRatio, momentRatio, pt, astRequired, astProvided, isSafe, dDashD, chartText };
   }, [inputs, bars]);
+
+  const handleShare = async () => {
+    const shareText = `Column Design Report:\nLoad (Pu): ${inputs.Pu} kN\nMoment (Mu): ${inputs.Mu} kNm\nSize: ${inputs.b}x${inputs.D}mm\nEffective Cover: ${inputs.cover}mm\nd'/D Ratio: ${calc.dDashD}\n${calc.chartText}\nChart Value (pt/fck): ${inputs.ptFck}\nPu/(fck b D): ${calc.axialRatio}\nMu/(fck b D²): ${calc.momentRatio}\nAst Req: ${calc.astRequired.toFixed(2)} sqmm\nAst Prov: ${calc.astProvided.toFixed(2)} sqmm\nStatus: ${calc.isSafe ? 'OK' : 'Revise'}`;
+    
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: 'Uniq Designs - Column Report', text: shareText });
+      } catch (error) { console.log('Error sharing:', error); }
+    } else {
+      alert("Sharing is not supported on this browser.");
+    }
+  };
 
   // UI Component for Rows
   const Cell = ({ label, value, unit, color, isHighlight }: any) => (
@@ -122,8 +138,8 @@ export default function RectangularColumnTool() {
         fontFamily: 'monospace', 
         fontWeight: '900', 
         fontSize: isHighlight ? '15px' : 'inherit',
-        color: isHighlight ? '#cc0000' : 'inherit', // Red text for highlight
-        backgroundColor: isHighlight ? '#ffffff' : 'transparent', // White background pill
+        color: isHighlight ? '#cc0000' : 'inherit', 
+        backgroundColor: isHighlight ? '#ffffff' : 'transparent', 
         padding: isHighlight ? '2px 8px' : '0',
         borderRadius: isHighlight ? '12px' : '0',
         border: isHighlight ? '1px solid #cc0000' : 'none',
@@ -140,13 +156,13 @@ export default function RectangularColumnTool() {
     <div id="printable-area" style={{ width: '100%', maxWidth: '420px', margin: '0 auto', fontFamily: 'sans-serif', backgroundColor: '#f9f9f9', minHeight: '100vh', boxSizing: 'border-box', padding: '10px' }}>
       <style>{`
         * { box-sizing: border-box; }
-        input, select { font-size: 16px !important; } /* Prevents iOS Safari Auto-Zoom */
+        input, select { font-size: 16px !important; }
         @media print {
           @page { size: auto; margin: 0; }
           body { margin: 0; padding: 0; overflow: hidden; background: #fff; }
           #printable-area { border: none !important; width: 100% !important; max-width: 100% !important; margin: 0 !important; padding: 0 !important; }
           .no-print { display: none !important; }
-          header, .blue-box, .yellow-row, .green-bar, .status-bar { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+          header, .blue-box, .yellow-row, .green-bar, .status-bar, .chart-text { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
           input, select { border: none !important; background: transparent !important; pointer-events: none; -webkit-appearance: none; appearance: none;}
         }
       `}</style>
@@ -173,19 +189,26 @@ export default function RectangularColumnTool() {
               </div>
             </div>
 
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(255,255,255,0.4)', padding: '8px 10px', borderRadius: '6px' }}>
-              <label style={{ fontSize: '12px', fontWeight: 'bold', color: '#003366' }}>Width (b) mm</label>
-              <input type="number" onFocus={handleFocus} value={inputs.b} onChange={e => updateInput('b', e.target.value)} style={{ width: '100px', textAlign: 'right', padding: '6px', border: '1px solid #0070c0', borderRadius: '4px', fontWeight: 'bold' }} />
-            </div>
-            
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(255,255,255,0.4)', padding: '8px 10px', borderRadius: '6px' }}>
-              <label style={{ fontSize: '12px', fontWeight: 'bold', color: '#003366' }}>Depth (D) mm</label>
-              <input type="number" onFocus={handleFocus} value={inputs.D} onChange={e => updateInput('D', e.target.value)} style={{ width: '100px', textAlign: 'right', padding: '6px', border: '1px solid #0070c0', borderRadius: '4px', fontWeight: 'bold' }} />
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+              <div style={{ background: 'rgba(255,255,255,0.4)', padding: '8px', borderRadius: '6px' }}>
+                <label style={{ fontSize: '11px', fontWeight: 'bold', color: '#003366', display: 'block', marginBottom: '4px' }}>Width (b) mm</label>
+                <input type="number" onFocus={handleFocus} value={inputs.b} onChange={e => updateInput('b', e.target.value)} style={{ width: '100%', textAlign: 'right', padding: '6px', border: '1px solid #0070c0', borderRadius: '4px', fontWeight: 'bold' }} />
+              </div>
+              <div style={{ background: 'rgba(255,255,255,0.4)', padding: '8px', borderRadius: '6px' }}>
+                <label style={{ fontSize: '11px', fontWeight: 'bold', color: '#003366', display: 'block', marginBottom: '4px' }}>Depth (D) mm</label>
+                <input type="number" onFocus={handleFocus} value={inputs.D} onChange={e => updateInput('D', e.target.value)} style={{ width: '100%', textAlign: 'right', padding: '6px', border: '1px solid #0070c0', borderRadius: '4px', fontWeight: 'bold' }} />
+              </div>
             </div>
 
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: 'rgba(255,255,255,0.4)', padding: '8px 10px', borderRadius: '6px' }}>
-              <label style={{ fontSize: '12px', fontWeight: 'bold', color: '#003366' }}>Length (L) m</label>
-              <input type="number" onFocus={handleFocus} value={inputs.L} onChange={e => updateInput('L', e.target.value)} style={{ width: '100px', textAlign: 'right', padding: '6px', border: '1px solid #0070c0', borderRadius: '4px', fontWeight: 'bold' }} />
+            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
+              <div style={{ background: 'rgba(255,255,255,0.4)', padding: '8px', borderRadius: '6px' }}>
+                <label style={{ fontSize: '11px', fontWeight: 'bold', color: '#003366', display: 'block', marginBottom: '4px' }}>Length (L) m</label>
+                <input type="number" onFocus={handleFocus} value={inputs.L} onChange={e => updateInput('L', e.target.value)} style={{ width: '100%', textAlign: 'right', padding: '6px', border: '1px solid #0070c0', borderRadius: '4px', fontWeight: 'bold' }} />
+              </div>
+              <div style={{ background: 'rgba(255,255,255,0.4)', padding: '8px', borderRadius: '6px' }}>
+                <label style={{ fontSize: '11px', fontWeight: 'bold', color: '#003366', display: 'block', marginBottom: '4px' }}>Cover (d') mm</label>
+                <input type="number" onFocus={handleFocus} value={inputs.cover} onChange={e => updateInput('cover', e.target.value)} style={{ width: '100%', textAlign: 'right', padding: '6px', border: '1px solid #0070c0', borderRadius: '4px', fontWeight: 'bold', color: '#000' }} />
+              </div>
             </div>
 
             <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
@@ -193,13 +216,25 @@ export default function RectangularColumnTool() {
                 {[20, 25, 30, 35, 40].map(v => <option key={v} value={v}>M{v}</option>)}
               </select>
               <select value={inputs.fy} onChange={e => updateInput('fy', e.target.value)} style={{ padding: '10px', borderRadius: '4px', border: '1px solid #0070c0', fontWeight: 'bold' }}>
-                {[415, 500, 550].map(v => <option key={v} value={v}>Fe{v}</option>)}
+                {[250, 415, 500].map(v => <option key={v} value={v}>Fe{v}</option>)}
               </select>
             </div>
 
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', background: '#ffe699', padding: '10px', borderRadius: '6px', marginTop: '4px', border: '2px dashed #d6a100' }}>
-              <label style={{ fontSize: '12px', fontWeight: '900', color: '#b38600' }}>Chart Value (pt/fck)</label>
-              <input type="number" step="0.01" onFocus={handleFocus} value={inputs.ptFck} onChange={e => updateInput('ptFck', e.target.value)} style={{ width: '100px', textAlign: 'right', padding: '8px', border: '2px solid #b38600', borderRadius: '4px', fontWeight: '900', fontSize: '16px', color: '#000' }} />
+            <div style={{ background: '#ffe699', padding: '12px', borderRadius: '6px', marginTop: '4px', border: '2px dashed #d6a100' }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
+                <span style={{ fontSize: '11px', fontWeight: 'bold', color: '#b38600' }}>Calculated d'/D</span>
+                <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#cc0000', backgroundColor: '#fff', padding: '2px 8px', borderRadius: '4px', border: '1px solid #d6a100' }}>{calc.dDashD}</span>
+              </div>
+              
+              {/* Dynamic Chart Reference Text */}
+              <div className="chart-text" style={{ textAlign: 'center', color: '#008000', fontWeight: 'bold', fontSize: '14px', marginBottom: '10px', letterSpacing: '0.5px' }}>
+                {calc.chartText}
+              </div>
+              
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+                <label style={{ fontSize: '13px', fontWeight: '900', color: '#b38600' }}>pt / fck</label>
+                <input type="number" step="0.01" onFocus={handleFocus} value={inputs.ptFck} onChange={e => updateInput('ptFck', e.target.value)} style={{ width: '100px', textAlign: 'center', padding: '8px', border: '2px solid #b38600', borderRadius: '4px', fontWeight: '900', fontSize: '16px', color: '#cc0000' }} />
+              </div>
             </div>
           </div>
         </div>
@@ -209,7 +244,6 @@ export default function RectangularColumnTool() {
           <div className="yellow-row"><Cell label="Min Eccentricity (ex)" value={calc.ex.toFixed(2)} unit="mm" color="#ffff00" /></div>
           <div className="yellow-row"><Cell label="Min Eccentricity (ey)" value={calc.ey.toFixed(2)} unit="mm" color="#ffff00" /></div>
           
-          {/* Highlighted Rows Below */}
           <div className="yellow-row"><Cell label="Pu / (fck b D)" value={calc.axialRatio} unit="" color="#ffff00" isHighlight={true} /></div>
           <div className="yellow-row"><Cell label="Mu / (fck b D²)" value={calc.momentRatio} unit="" color="#ffff00" isHighlight={true} /></div>
           

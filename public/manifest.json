@@ -1,6 +1,6 @@
 {
-  "name": "Doubly Reinforced Beam Tool",
-  "short_name": "Doubly Reinforced Beam Tool",
+  "name": "Column Design Tool",
+  "short_name": "Column Design Tool",
   "description": "Professional Structural Design Tool",
   "start_url": "/",
   "display": "standalone",

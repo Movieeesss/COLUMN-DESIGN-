@@ -1,6 +1,7 @@
 import React from 'react'
 import ReactDOM from 'react-dom/client'
-import DoublyReinforcedTool from './DoublyReinforced' // Fixed: removed { }
+// Import the new Column Design component (Ensure the export name matches your ColumnDesign.tsx file)
+import RectangularColumnTool from './ColumnDesign' 
 import './style.css'
 
 // Ensure 'root' matches your index.html div id
@@ -9,7 +10,8 @@ const rootElement = document.getElementById('root') || document.getElementById('
 if (rootElement) {
   ReactDOM.createRoot(rootElement).render(
     <React.StrictMode>
-      <DoublyReinforcedTool />
+      {/* Render the new column tool here */}
+      <RectangularColumnTool />
     </React.StrictMode>,
   )
 }

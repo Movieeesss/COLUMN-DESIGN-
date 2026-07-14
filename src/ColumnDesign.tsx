@@ -1,304 +1,406 @@
-import React, { useState, useEffect, useMemo } from 'react';
+// ============================================================================
+// IS 456:2000 Annex E — Strain Compatibility Solver for Rectangular Columns
+// Reinforcement idealized on two opposite faces (matches SP16 Chart 27-38
+// convention), uniaxial bending. Bypasses SP16 charts entirely.
+// ============================================================================
+//
+// METHOD
+// 1. Concrete: parabolic-rectangular stress block (IS456 Fig 21), max strain
+//    0.0035 at the highly compressed extreme fibre when xu <= D.
+//    When xu > D (whole section in compression), strain profile follows
+//    Annex E.2: max edge strain reduces below 0.0035, and strain = 0.002 is
+//    held fixed at 3D/7 from the highly compressed edge.
+// 2. Steel: IS456 Fig 23 design curve. Linear elastic up to 0.8*(0.87 fy),
+//    then table-interpolated inelastic branch up to 0.87 fy (perfectly
+//    plastic beyond). Fe250 is linear elastic-plastic (no strain hardening
+//    table — mild steel has a sharp defined yield).
+// 3. Section is discretized into thin strips (fibre model) and integrated
+//    numerically — this converges to the closed-form result as strip count
+//    increases, and is easy to verify/debug against your Excel sheet.
+// 4. Double bisection solve:
+//      outer loop  -> trial Ast, split into two layers (compression + tension face)
+//      inner loop  -> trial xu, solved so computed Pu matches applied Pu
+//    then Mu_capacity at that (Ast, xu) is compared to applied Mu, and Ast is
+//    adjusted until both Pu and Mu are simultaneously satisfied.
+//
+// VALIDATE BEFORE PRODUCTION USE: cross-check 2-3 outputs against known SP16
+// chart readings (or your Excel xu/D sweep) before wiring this into live
+// project calculations. Strain-compatibility and SP16 charts should agree
+// within a few percent — if they don't, check bar layer / cover assumptions
+// first (this module assumes ALL steel lumped into two layers at d' and D-d',
+// same as the SP16 two-face charts; if your section has bars on all 4 faces,
+// this will NOT match Charts 27-38 and needs the layer geometry changed).
+// ============================================================================
 
-// SP 16 Chart Mapping Data
-const CHART_DATA: Record<number, Record<string, { chart: number, page: number }>> = {
-  250: { '0.05': { chart: 27, page: 112 }, '0.1': { chart: 28, page: 113 }, '0.15': { chart: 29, page: 114 }, '0.2': { chart: 30, page: 115 } },
-  415: { '0.05': { chart: 31, page: 116 }, '0.1': { chart: 32, page: 117 }, '0.15': { chart: 33, page: 118 }, '0.2': { chart: 34, page: 119 } },
-  500: { '0.05': { chart: 35, page: 120 }, '0.1': { chart: 36, page: 121 }, '0.15': { chart: 37, page: 122 }, '0.2': { chart: 38, page: 123 } },
+export interface ColumnSolverInputs {
+  Pu: number;     // kN, factored axial load
+  Mu: number;     // kNm, factored uniaxial moment
+  fck: number;    // N/mm2 (20, 25, 30, 35, 40...)
+  fy: number;     // N/mm2 (250 | 415 | 500)
+  b: number;      // mm, width
+  D: number;      // mm, overall depth (in the plane of bending)
+  cover: number;  // mm, effective cover d' to bar centroid
+}
+
+export interface ColumnSolverResult {
+  xu: number;              // mm, converged neutral axis depth
+  AstCalculated: number;   // mm2, from equilibrium (before min-steel check)
+  ptCalculated: number;    // %, 100*Ast/(b*D)
+  AstProvided: number;     // mm2, max(AstCalculated, 0.8% b D)
+  ptProvided: number;      // %
+  AstMin: number;          // mm2, 0.8% b D per IS456 26.5.3.1
+  governedByMinSteel: boolean;
+  Pu_capacity: number;     // kN, capacity check at converged state
+  Mu_capacity: number;     // kNm
+  converged: boolean;
+  outerIterations: number;
+  innerIterations: number;
+}
+
+// ---------------------------------------------------------------------------
+// Steel design stress-strain curve (IS456 Fig 23)
+// Table fractions are of the DESIGN yield stress 0.87*fy (i.e. fy/gamma_m,
+// gamma_m = 1.15), not of fy directly. First table point lands exactly on
+// the elastic line (stress = Es * strain), which is the internal consistency
+// check that confirms this table is being applied correctly.
+// ---------------------------------------------------------------------------
+
+const Es = 200000; // N/mm2, modulus of elasticity of steel
+
+// fraction of (0.87*fy), strain
+const INELASTIC_TABLE: { frac: number; strain: number }[] = [
+  { frac: 0.80,  strain: 0.00174 }, // placeholder overwritten per-grade below
+];
+
+const STEEL_TABLES: Record<number, { frac: number; strain: number }[]> = {
+  415: [
+    { frac: 0.80,  strain: 0.00144 },
+    { frac: 0.85,  strain: 0.00163 },
+    { frac: 0.90,  strain: 0.00192 },
+    { frac: 0.95,  strain: 0.00241 },
+    { frac: 0.975, strain: 0.00276 },
+    { frac: 1.00,  strain: 0.00380 },
+  ],
+  500: [
+    { frac: 0.80,  strain: 0.00174 },
+    { frac: 0.85,  strain: 0.00195 },
+    { frac: 0.90,  strain: 0.00226 },
+    { frac: 0.95,  strain: 0.00277 },
+    { frac: 0.975, strain: 0.00312 },
+    { frac: 1.00,  strain: 0.00417 },
+  ],
 };
 
-// Default values
-const DEFAULT_INPUTS = {
-  Pu: '5000', // Updated based on your recent screenshot
-  Mu: '150',  // Updated based on your recent screenshot
-  b: '230', 
-  D: '750', 
-  L: '3.0',
-  fck: 25, 
-  fy: 500, 
-  cover: '52.5', // New Input for Effective Cover (d')
-  ptFck: '0.06'
-};
+/**
+ * Steel stress (N/mm2) for a given SIGNED strain (+ compression, - tension).
+ * IS456 treats the design curve as symmetric for tension/compression.
+ */
+function steelStress(strainSigned: number, fy: number): number {
+  const strain = Math.abs(strainSigned);
+  const sign = strainSigned >= 0 ? 1 : -1;
 
-const DEFAULT_BARS: Record<string, number> = {
-  '8': 0, '10': 0, '12': 0, '16': 0, '20': 0, '25': 0, '32': 0
-};
+  if (strain === 0) return 0;
 
-export default function RectangularColumnTool() {
-  const [inputs, setInputs] = useState(() => {
-    const saved = localStorage.getItem('col_inputs');
-    return saved ? JSON.parse(saved) : DEFAULT_INPUTS;
-  });
+  if (fy === 250) {
+    // Mild steel: sharp defined yield, linear elastic then perfectly plastic
+    const fyDesign = 0.87 * fy;
+    const yieldStrain = fyDesign / Es;
+    if (strain <= yieldStrain) return sign * Es * strain;
+    return sign * fyDesign;
+  }
 
-  const [bars, setBars] = useState(() => {
-    const saved = localStorage.getItem('col_bars');
-    return saved ? JSON.parse(saved) : DEFAULT_BARS;
-  });
+  const table = STEEL_TABLES[fy];
+  if (!table) {
+    throw new Error(`No stress-strain table for fy=${fy}. Supported: 250, 415, 500.`);
+  }
 
-  useEffect(() => {
-    localStorage.setItem('col_inputs', JSON.stringify(inputs));
-  }, [inputs]);
+  const fyDesign = 0.87 * fy;
+  const firstPoint = table[0];
+  const lastPoint = table[table.length - 1];
 
-  useEffect(() => {
-    localStorage.setItem('col_bars', JSON.stringify(bars));
-  }, [bars]);
+  // Elastic zone (below first table point): stress = Es * strain
+  if (strain <= firstPoint.strain) {
+    return sign * Es * strain;
+  }
 
-  const handleFocus = (e: React.FocusEvent<HTMLInputElement>) => e.target.select();
-  const updateInput = (key: string, value: string) => setInputs((prev: any) => ({ ...prev, [key]: value }));
-  const updateBar = (dia: string, val: string) => setBars((prev: any) => ({ ...prev, [dia]: parseInt(val) }));
+  // Beyond last table point: perfectly plastic at design yield
+  if (strain >= lastPoint.strain) {
+    return sign * fyDesign;
+  }
 
-  const handleReset = () => {
-    if(window.confirm("Are you sure you want to reset all data?")) {
-      setInputs(DEFAULT_INPUTS);
-      setBars(DEFAULT_BARS);
-      localStorage.removeItem('col_inputs');
-      localStorage.removeItem('col_bars');
+  // Interpolate within the inelastic table
+  for (let i = 0; i < table.length - 1; i++) {
+    const p0 = table[i];
+    const p1 = table[i + 1];
+    if (strain >= p0.strain && strain <= p1.strain) {
+      const t = (strain - p0.strain) / (p1.strain - p0.strain);
+      const frac = p0.frac + t * (p1.frac - p0.frac);
+      return sign * frac * fyDesign;
     }
+  }
+
+  return sign * fyDesign; // fallback, shouldn't reach here
+}
+
+// ---------------------------------------------------------------------------
+// Concrete stress block (IS456 Fig 21) — parabolic-rectangular
+// ---------------------------------------------------------------------------
+
+function concreteStress(strain: number, fck: number): number {
+  if (strain <= 0) return 0; // no tension capacity assumed
+  if (strain <= 0.002) {
+    const r = strain / 0.002;
+    return 0.446 * fck * (2 * r - r * r);
+  }
+  // 0.002 < strain <= 0.0035 (and capped there — strain shouldn't exceed
+  // 0.0035 anywhere in the section under this profile model)
+  return 0.446 * fck;
+}
+
+// ---------------------------------------------------------------------------
+// Strain profile across the section depth
+// y = distance from the highly compressed extreme fibre, 0 <= y <= D
+// ---------------------------------------------------------------------------
+
+function strainAt(y: number, xu: number, D: number): number {
+  if (xu <= D) {
+    // Neutral axis within (or at edge of) the section — standard linear
+    // profile, zero at the neutral axis, 0.0035 at the compressed edge.
+    return 0.0035 * (xu - y) / xu;
+  }
+
+  // xu > D: whole section in compression, Annex E.2.
+  // Max edge strain reduces as D/xu decreases; strain is anchored at 0.002
+  // at 3D/7 from the highly compressed edge, and varies linearly.
+  const ecMax = 0.0035 * (0.25 + 0.75 * (D / xu));
+  const yRef = (3 * D) / 7;
+  return ecMax - (ecMax - 0.002) * (y / yRef);
+}
+
+// ---------------------------------------------------------------------------
+// Section force/moment via strip (fibre) integration
+// Returns Pu (kN, +compression) and Mu (kNm) about the section mid-depth.
+// ---------------------------------------------------------------------------
+
+const STRIP_COUNT = 300; // increase for more precision, at some perf cost
+
+function computeSectionForces(
+  xu: number,
+  Ast: number,
+  inputs: Pick<ColumnSolverInputs, 'b' | 'D' | 'cover' | 'fck' | 'fy'>
+): { Pu: number; Mu: number } {
+  const { b, D, cover, fck, fy } = inputs;
+  const dy = D / STRIP_COUNT;
+
+  let forceSum = 0;   // N
+  let momentSum = 0;  // N.mm, about mid-depth
+
+  // --- Concrete strips ---
+  for (let i = 0; i < STRIP_COUNT; i++) {
+    const y = (i + 0.5) * dy; // strip centroid from highly compressed edge
+    const strain = strainAt(y, xu, D);
+    const stress = concreteStress(strain, fck);
+    if (stress === 0) continue;
+    const force = stress * b * dy;
+    const arm = D / 2 - y; // + above mid-depth (toward compressed edge)
+    forceSum += force;
+    momentSum += force * arm;
+  }
+
+  // --- Steel layers: two-face idealization (matches SP16 Chart 27-38) ---
+  const AstLayer = Ast / 2;
+  const layerPositions = [cover, D - cover]; // near-edge layer, far-edge layer
+
+  for (const y of layerPositions) {
+    const strain = strainAt(y, xu, D);
+    let stress = steelStress(strain, fy);
+
+    // If this layer sits in the concrete compression zone, the concrete
+    // "displaced" by the bar is double-counted in the strip integration
+    // above — net it out (standard correction).
+    if (strain > 0) {
+      stress -= concreteStress(strain, fck);
+    }
+
+    const force = stress * AstLayer;
+    const arm = D / 2 - y;
+    forceSum += force;
+    momentSum += force * arm;
+  }
+
+  return {
+    Pu: forceSum / 1000,      // N -> kN
+    Mu: momentSum / 1_000_000 // N.mm -> kNm
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Inner solve: for a fixed Ast, find xu such that Pu_capacity == Pu_applied
+// ---------------------------------------------------------------------------
+
+function solveNeutralAxis(
+  Ast: number,
+  Pu_applied: number,
+  section: Pick<ColumnSolverInputs, 'b' | 'D' | 'cover' | 'fck' | 'fy'>,
+  maxIter = 60,
+  tolKN = 0.05
+): { xu: number; iterations: number; converged: boolean; Pu: number; Mu: number } {
+  const { D } = section;
+
+  let lo = 0.001 * D;   // near-zero neutral axis (almost pure tension face yield)
+  let hi = 20 * D;      // effectively "whole section deep in compression"
+
+  let fLo = computeSectionForces(lo, Ast, section).Pu - Pu_applied;
+  let fHi = computeSectionForces(hi, Ast, section).Pu - Pu_applied;
+
+  // Pu_capacity is monotonically increasing with xu. If applied Pu is out of
+  // the achievable range for this Ast, clamp to the nearest bound.
+  if (fLo >= 0) {
+    const r = computeSectionForces(lo, Ast, section);
+    return { xu: lo, iterations: 0, converged: false, Pu: r.Pu, Mu: r.Mu };
+  }
+  if (fHi <= 0) {
+    const r = computeSectionForces(hi, Ast, section);
+    return { xu: hi, iterations: 0, converged: false, Pu: r.Pu, Mu: r.Mu };
+  }
+
+  let mid = (lo + hi) / 2;
+  let result = computeSectionForces(mid, Ast, section);
+  let i = 0;
+  for (; i < maxIter; i++) {
+    mid = (lo + hi) / 2;
+    result = computeSectionForces(mid, Ast, section);
+    const diff = result.Pu - Pu_applied;
+
+    if (Math.abs(diff) < tolKN) {
+      return { xu: mid, iterations: i + 1, converged: true, Pu: result.Pu, Mu: result.Mu };
+    }
+    if (diff < 0) lo = mid; else hi = mid;
+  }
+
+  return { xu: mid, iterations: i, converged: false, Pu: result.Pu, Mu: result.Mu };
+}
+
+// ---------------------------------------------------------------------------
+// Outer solve: find Ast such that, at the xu solved above, Mu_capacity
+// matches Mu_applied.
+// ---------------------------------------------------------------------------
+
+export function solveColumnSteelIS456(
+  inputs: ColumnSolverInputs,
+  options?: { maxOuterIter?: number; tolKNm?: number }
+): ColumnSolverResult {
+  const { Pu, Mu, b, D, cover, fck, fy } = inputs;
+  const maxOuterIter = options?.maxOuterIter ?? 60;
+  const tolKNm = options?.tolKNm ?? 0.1;
+
+  const AstMin = 0.008 * b * D; // 0.8% per IS456 26.5.3.1
+  const AstMax = 0.06 * b * D;  // 6% practical upper bound for the search
+
+  const section = { b, D, cover, fck, fy };
+
+  let lo = AstMin;
+  let hi = AstMax;
+
+  const evalAt = (Ast: number) => {
+    const inner = solveNeutralAxis(Ast, Pu, section);
+    return { ...inner, Mu_diff: inner.Mu - Mu };
   };
 
-  // --- USEMEMO FOR CALCULATIONS & EXCEL LOGIC ---
-  const calc = useMemo(() => {
-    const n = {
-      Pu: parseFloat(inputs.Pu) || 0,
-      Mu: parseFloat(inputs.Mu) || 0,
-      b: parseFloat(inputs.b) || 0,
-      D: parseFloat(inputs.D) || 0,
-      L: parseFloat(inputs.L) || 0,
-      cover: parseFloat(inputs.cover) || 0,
-      ptFck: parseFloat(inputs.ptFck) || 0,
-      fck: inputs.fck,
-      fy: inputs.fy
-    };
+  let loEval = evalAt(lo);
+  let hiEval = evalAt(hi);
 
-    const pu_N = n.Pu * 1000;
-    const mu_Nmm = n.Mu * 1000000;
-    const L_mm = n.L * 1000;
+  let outerIter = 0;
+  let converged = false;
+  let best = loEval;
+  let bestAst = lo;
 
-    // Minimum Eccentricity
-    const ex = Math.max((L_mm / 500) + (n.D / 30), 20);
-    const ey = Math.max((L_mm / 500) + (n.b / 30), 20);
+  if (loEval.Mu_diff >= 0) {
+    // Even minimum steel gives enough moment capacity at this Pu
+    best = loEval;
+    bestAst = lo;
+    converged = true;
+  } else if (hiEval.Mu_diff <= 0) {
+    // Section is undersized even at 6% steel — return the 6% result flagged
+    // as not converged so the caller knows to increase section size.
+    best = hiEval;
+    bestAst = hi;
+    converged = false;
+  } else {
+    let mid = (lo + hi) / 2;
+    let midEval = evalAt(mid);
+    for (; outerIter < maxOuterIter; outerIter++) {
+      mid = (lo + hi) / 2;
+      midEval = evalAt(mid);
 
-    // Non-Dimensional Parameters (Rounded to 2 decimals)
-    const axialRatioRaw = (n.b > 0 && n.D > 0 && n.fck > 0) ? pu_N / (n.fck * n.b * n.D) : 0;
-    const momentRatioRaw = (n.b > 0 && n.D > 0 && n.fck > 0) ? mu_Nmm / (n.fck * n.b * (n.D * n.D)) : 0;
-    
-    const axialRatio = axialRatioRaw.toFixed(2);
-    const momentRatio = momentRatioRaw.toFixed(2);
+      if (Math.abs(midEval.Mu_diff) < tolKNm) {
+        best = midEval;
+        bestAst = mid;
+        converged = true;
+        break;
+      }
+      if (midEval.Mu_diff < 0) lo = mid; else hi = mid;
+    }
+    if (!converged) {
+      best = midEval;
+      bestAst = mid;
+    }
+  }
 
-    // --- YOUR EXCEL LOGIC FOR d'/D ---
-    // =IF(cover/D <= 0.05, 0.05, IF(cover/D <= 0.1, 0.1, IF(cover/D <= 0.15, 0.15, 0.2)))
-    const rawRatio = n.D > 0 ? (n.cover / n.D) : 0;
-    let dDashD = '0.05';
-    if (rawRatio <= 0.05) dDashD = '0.05';
-    else if (rawRatio <= 0.10) dDashD = '0.1';
-    else if (rawRatio <= 0.15) dDashD = '0.15';
-    else dDashD = '0.2';
+  const AstCalculated = bestAst;
+  const AstProvided = Math.max(AstCalculated, AstMin);
+  const governedByMinSteel = AstProvided === AstMin && AstCalculated < AstMin;
 
-    // Chart Text Generation
-    const currentChart = CHART_DATA[n.fy]?.[dDashD];
-    const chartText = currentChart 
-      ? `Refer Chart ${currentChart.chart} of SP 16, Page no: ${currentChart.page}` 
-      : "Chart details not available";
+  return {
+    xu: best.xu,
+    AstCalculated,
+    ptCalculated: (100 * AstCalculated) / (b * D),
+    AstProvided,
+    ptProvided: (100 * AstProvided) / (b * D),
+    AstMin,
+    governedByMinSteel,
+    Pu_capacity: best.Pu,
+    Mu_capacity: best.Mu,
+    converged,
+    outerIterations: outerIter,
+    innerIterations: best.iterations,
+  };
+}
 
-    // Required Steel
-    const pt = n.ptFck * n.fck;
-    const astRequired = (pt / 100) * n.b * n.D;
+// ---------------------------------------------------------------------------
+// Bonus: full interaction curve generator (for a chart-style visual), given
+// a chosen pt/fck ratio. Sweeps xu and returns non-dimensional points, same
+// shape of data as one curve on an SP16-style chart.
+// ---------------------------------------------------------------------------
 
-    // Provided Steel
-    let astProvided = 0;
-    Object.keys(bars).forEach(diaStr => {
-      const dia = parseInt(diaStr);
-      const nos = bars[diaStr];
-      const area = (Math.PI / 4) * (dia * dia);
-      astProvided += (area * nos);
+export interface InteractionPoint {
+  xuByD: number;
+  puByFckbD: number;
+  muByFckbD2: number;
+}
+
+export function generateInteractionCurve(
+  ptFck: number,
+  section: Pick<ColumnSolverInputs, 'b' | 'D' | 'cover' | 'fck' | 'fy'>,
+  steps = 194 // matches your Excel sweep resolution
+): InteractionPoint[] {
+  const { b, D, fck } = section;
+  const Ast = (ptFck * fck / 100) * b * D;
+  const points: InteractionPoint[] = [];
+
+  const xuByDMin = 0.05;
+  const xuByDMax = 3.0; // covers well into the "whole section in compression" zone
+
+  for (let i = 0; i <= steps; i++) {
+    const xuByD = xuByDMin + ((xuByDMax - xuByDMin) * i) / steps;
+    const xu = xuByD * D;
+    const { Pu, Mu } = computeSectionForces(xu, Ast, section);
+    points.push({
+      xuByD,
+      puByFckbD: (Pu * 1000) / (fck * b * D),
+      muByFckbD2: (Mu * 1_000_000) / (fck * b * D * D),
     });
+  }
 
-    const isSafe = astProvided >= astRequired;
-
-    return { ex, ey, axialRatio, momentRatio, pt, astRequired, astProvided, isSafe, dDashD, chartText };
-  }, [inputs, bars]);
-
-  const handleShare = async () => {
-    const shareText = `Column Design Report:\nLoad (Pu): ${inputs.Pu} kN\nMoment (Mu): ${inputs.Mu} kNm\nSize: ${inputs.b}x${inputs.D}mm\nEffective Cover: ${inputs.cover}mm\nd'/D Ratio: ${calc.dDashD}\n${calc.chartText}\nChart Value (pt/fck): ${inputs.ptFck}\nPu/(fck b D): ${calc.axialRatio}\nMu/(fck b D²): ${calc.momentRatio}\nAst Req: ${calc.astRequired.toFixed(2)} sqmm\nAst Prov: ${calc.astProvided.toFixed(2)} sqmm\nStatus: ${calc.isSafe ? 'OK' : 'Revise'}`;
-    
-    if (navigator.share) {
-      try {
-        await navigator.share({ title: 'Uniq Designs - Column Report', text: shareText });
-      } catch (error) { console.log('Error sharing:', error); }
-    } else {
-      alert("Sharing is not supported on this browser.");
-    }
-  };
-
-  // UI Component for Rows
-  const Cell = ({ label, value, unit, color, isHighlight }: any) => (
-    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '9px 12px', borderBottom: '1px solid rgba(0,0,0,0.05)', backgroundColor: color || '#fff', fontSize: '13px', boxSizing: 'border-box' }}>
-      <span style={{ fontWeight: 'bold' }}>{label}</span>
-      <span style={{ 
-        fontFamily: 'monospace', 
-        fontWeight: '900', 
-        fontSize: isHighlight ? '15px' : 'inherit',
-        color: isHighlight ? '#cc0000' : 'inherit', 
-        backgroundColor: isHighlight ? '#ffffff' : 'transparent', 
-        padding: isHighlight ? '2px 8px' : '0',
-        borderRadius: isHighlight ? '12px' : '0',
-        border: isHighlight ? '1px solid #cc0000' : 'none',
-        boxShadow: isHighlight ? '0px 2px 4px rgba(0,0,0,0.1)' : 'none'
-      }}>
-        {value} <small style={{fontSize: '9px', color: '#000'}}>{unit}</small>
-      </span>
-    </div>
-  );
-
-  const barOptions = [0, 2, 4, 6, 8, 10, 12, 14, 16];
-
-  return (
-    <div id="printable-area" style={{ width: '100%', maxWidth: '420px', margin: '0 auto', fontFamily: 'sans-serif', backgroundColor: '#f9f9f9', minHeight: '100vh', boxSizing: 'border-box', padding: '10px' }}>
-      <style>{`
-        * { box-sizing: border-box; }
-        input, select { font-size: 16px !important; }
-        @media print {
-          @page { size: auto; margin: 0; }
-          body { margin: 0; padding: 0; overflow: hidden; background: #fff; }
-          #printable-area { border: none !important; width: 100% !important; max-width: 100% !important; margin: 0 !important; padding: 0 !important; }
-          .no-print { display: none !important; }
-          header, .blue-box, .yellow-row, .green-bar, .status-bar, .chart-text { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
-          input, select { border: none !important; background: transparent !important; pointer-events: none; -webkit-appearance: none; appearance: none;}
-        }
-      `}</style>
-
-      <header style={{ backgroundColor: '#92d050', padding: '15px', textAlign: 'center', fontWeight: '900', fontSize: '16px', borderBottom: '2px solid #76b041', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderRadius: '8px 8px 0 0' }}>
-        <span>COLUMN DESIGN</span>
-        <button className="no-print" onClick={handleReset} style={{ background: '#fff', border: 'none', padding: '5px 10px', borderRadius: '4px', fontSize: '11px', fontWeight: 'bold', cursor: 'pointer', color: '#cc0000', boxShadow: '0 2px 4px rgba(0,0,0,0.1)' }}>RESET</button>
-      </header>
-
-      <div style={{ backgroundColor: '#fff', padding: '12px', border: '1px solid #ddd', borderRadius: '0 0 8px 8px', boxShadow: '0 4px 8px rgba(0,0,0,0.05)' }}>
-        {/* INPUT SECTION */}
-        <div className="blue-box" style={{ border: '3px solid #0070c0', borderRadius: '10px', overflow: 'hidden', marginBottom: '15px', backgroundColor: '#00b0f0' }}>
-          <div style={{ backgroundColor: '#0070c0', color: 'white', padding: '6px', fontSize: '11px', fontWeight: 'bold', textAlign: 'center', letterSpacing: '1px' }}>EDITABLE DATA</div>
-          <div style={{ padding: '12px', display: 'flex', flexDirection: 'column', gap: '10px' }}>
-            
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-              <div style={{ background: 'rgba(255,255,255,0.4)', padding: '8px', borderRadius: '6px' }}>
-                <label style={{ fontSize: '11px', fontWeight: 'bold', color: '#003366', display: 'block', marginBottom: '4px' }}>Load (Pu) kN</label>
-                <input type="number" onFocus={handleFocus} value={inputs.Pu} onChange={e => updateInput('Pu', e.target.value)} style={{ width: '100%', textAlign: 'right', padding: '6px', border: '1px solid #0070c0', borderRadius: '4px', fontWeight: 'bold' }} />
-              </div>
-              <div style={{ background: 'rgba(255,255,255,0.4)', padding: '8px', borderRadius: '6px' }}>
-                <label style={{ fontSize: '11px', fontWeight: 'bold', color: '#003366', display: 'block', marginBottom: '4px' }}>Moment (Mu) kNm</label>
-                <input type="number" onFocus={handleFocus} value={inputs.Mu} onChange={e => updateInput('Mu', e.target.value)} style={{ width: '100%', textAlign: 'right', padding: '6px', border: '1px solid #0070c0', borderRadius: '4px', fontWeight: 'bold' }} />
-              </div>
-            </div>
-
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-              <div style={{ background: 'rgba(255,255,255,0.4)', padding: '8px', borderRadius: '6px' }}>
-                <label style={{ fontSize: '11px', fontWeight: 'bold', color: '#003366', display: 'block', marginBottom: '4px' }}>Width (b) mm</label>
-                <input type="number" onFocus={handleFocus} value={inputs.b} onChange={e => updateInput('b', e.target.value)} style={{ width: '100%', textAlign: 'right', padding: '6px', border: '1px solid #0070c0', borderRadius: '4px', fontWeight: 'bold' }} />
-              </div>
-              <div style={{ background: 'rgba(255,255,255,0.4)', padding: '8px', borderRadius: '6px' }}>
-                <label style={{ fontSize: '11px', fontWeight: 'bold', color: '#003366', display: 'block', marginBottom: '4px' }}>Depth (D) mm</label>
-                <input type="number" onFocus={handleFocus} value={inputs.D} onChange={e => updateInput('D', e.target.value)} style={{ width: '100%', textAlign: 'right', padding: '6px', border: '1px solid #0070c0', borderRadius: '4px', fontWeight: 'bold' }} />
-              </div>
-            </div>
-
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-              <div style={{ background: 'rgba(255,255,255,0.4)', padding: '8px', borderRadius: '6px' }}>
-                <label style={{ fontSize: '11px', fontWeight: 'bold', color: '#003366', display: 'block', marginBottom: '4px' }}>Length (L) m</label>
-                <input type="number" onFocus={handleFocus} value={inputs.L} onChange={e => updateInput('L', e.target.value)} style={{ width: '100%', textAlign: 'right', padding: '6px', border: '1px solid #0070c0', borderRadius: '4px', fontWeight: 'bold' }} />
-              </div>
-              <div style={{ background: 'rgba(255,255,255,0.4)', padding: '8px', borderRadius: '6px' }}>
-                <label style={{ fontSize: '11px', fontWeight: 'bold', color: '#003366', display: 'block', marginBottom: '4px' }}>Cover (d') mm</label>
-                <input type="number" onFocus={handleFocus} value={inputs.cover} onChange={e => updateInput('cover', e.target.value)} style={{ width: '100%', textAlign: 'right', padding: '6px', border: '1px solid #0070c0', borderRadius: '4px', fontWeight: 'bold', color: '#000' }} />
-              </div>
-            </div>
-
-            <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px' }}>
-              <select value={inputs.fck} onChange={e => updateInput('fck', e.target.value)} style={{ padding: '10px', borderRadius: '4px', border: '1px solid #0070c0', fontWeight: 'bold' }}>
-                {[20, 25, 30, 35, 40].map(v => <option key={v} value={v}>M{v}</option>)}
-              </select>
-              <select value={inputs.fy} onChange={e => updateInput('fy', e.target.value)} style={{ padding: '10px', borderRadius: '4px', border: '1px solid #0070c0', fontWeight: 'bold' }}>
-                {[250, 415, 500].map(v => <option key={v} value={v}>Fe{v}</option>)}
-              </select>
-            </div>
-
-            <div style={{ background: '#ffe699', padding: '12px', borderRadius: '6px', marginTop: '4px', border: '2px dashed #d6a100' }}>
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '8px' }}>
-                <span style={{ fontSize: '11px', fontWeight: 'bold', color: '#b38600' }}>Calculated d'/D</span>
-                <span style={{ fontSize: '13px', fontWeight: 'bold', color: '#cc0000', backgroundColor: '#fff', padding: '2px 8px', borderRadius: '4px', border: '1px solid #d6a100' }}>{calc.dDashD}</span>
-              </div>
-              
-              {/* Dynamic Chart Reference Text */}
-              <div className="chart-text" style={{ textAlign: 'center', color: '#008000', fontWeight: 'bold', fontSize: '14px', marginBottom: '10px', letterSpacing: '0.5px' }}>
-                {calc.chartText}
-              </div>
-              
-              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
-                <label style={{ fontSize: '13px', fontWeight: '900', color: '#b38600' }}>pt / fck</label>
-                <input type="number" step="0.01" onFocus={handleFocus} value={inputs.ptFck} onChange={e => updateInput('ptFck', e.target.value)} style={{ width: '100px', textAlign: 'center', padding: '8px', border: '2px solid #b38600', borderRadius: '4px', fontWeight: '900', fontSize: '16px', color: '#cc0000' }} />
-              </div>
-            </div>
-          </div>
-        </div>
-
-        {/* OUTPUT RATIOS SECTION (With Highlights) */}
-        <div style={{ border: '2px solid #e6e600', borderRadius: '8px', overflow: 'hidden', marginBottom: '15px', boxShadow: '0 2px 6px rgba(0,0,0,0.05)' }}>
-          <div className="yellow-row"><Cell label="Min Eccentricity (ex)" value={calc.ex.toFixed(2)} unit="mm" color="#ffff00" /></div>
-          <div className="yellow-row"><Cell label="Min Eccentricity (ey)" value={calc.ey.toFixed(2)} unit="mm" color="#ffff00" /></div>
-          
-          <div className="yellow-row"><Cell label="Pu / (fck b D)" value={calc.axialRatio} unit="" color="#ffff00" isHighlight={true} /></div>
-          <div className="yellow-row"><Cell label="Mu / (fck b D²)" value={calc.momentRatio} unit="" color="#ffff00" isHighlight={true} /></div>
-          
-          <div className="yellow-row"><Cell label="Steel Percentage (pt)" value={calc.pt.toFixed(2)} unit="%" color="#ffff00" /></div>
-          
-          <div className="green-bar" style={{ backgroundColor: '#92d050', padding: '15px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', borderTop: '2px solid #76b041' }}>
-            <span style={{ fontSize: '15px', fontWeight: '900' }}>REQ. Ast</span>
-            <span style={{ fontSize: '20px', fontWeight: '900', textShadow: '1px 1px 0px rgba(255,255,255,0.5)' }}>{calc.astRequired.toFixed(2)} mm²</span>
-          </div>
-        </div>
-
-        {/* REINFORCEMENT PROVIDED SECTION */}
-        <div style={{ border: '1px solid #ccc', borderRadius: '8px', overflow: 'hidden', marginBottom: '15px' }}>
-          <div style={{ backgroundColor: '#e2efda', padding: '10px', fontWeight: 'bold', fontSize: '13px', borderBottom: '1px solid #ccc', textAlign: 'center', letterSpacing: '0.5px' }}>
-            NUMBER OF BARS PROVIDED
-          </div>
-          <div style={{ display: 'grid', gridTemplateColumns: 'repeat(4, 1fr)', gap: '1px', backgroundColor: '#ccc' }}>
-            {['8', '10', '12', '16', '20', '25', '32'].map(dia => (
-              <div key={dia} style={{ backgroundColor: '#fff', padding: '10px 5px', display: 'flex', flexDirection: 'column', alignItems: 'center' }}>
-                <span style={{ fontSize: '12px', fontWeight: 'bold', color: '#cc0000', marginBottom: '6px' }}>{dia} mm</span>
-                <select 
-                  value={bars[dia]} 
-                  onChange={(e) => updateBar(dia, e.target.value)}
-                  style={{ padding: '6px 2px', border: '1px solid #aaa', borderRadius: '4px', fontSize: '14px', width: '90%', textAlign: 'center', fontWeight: 'bold', cursor: 'pointer' }}
-                >
-                  {barOptions.map(num => (
-                    <option key={num} value={num}>{num === 0 ? '-' : num}</option>
-                  ))}
-                </select>
-              </div>
-            ))}
-            <div style={{ backgroundColor: '#fff' }}></div>
-          </div>
-          
-          <div style={{ padding: '12px 15px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', backgroundColor: '#f4f4f4', borderTop: '1px solid #ccc' }}>
-             <span style={{ fontSize: '14px', fontWeight: '900' }}>PROV. Ast</span>
-             <span style={{ fontSize: '18px', fontFamily: 'monospace', fontWeight: '900', color: '#003366' }}>{calc.astProvided.toFixed(2)} mm²</span>
-          </div>
-
-          <div className="status-bar" style={{ backgroundColor: calc.isSafe ? '#92d050' : '#ff4c4c', color: calc.isSafe ? '#000' : '#fff', padding: '15px', textAlign: 'center', fontWeight: '900', fontSize: '16px', borderTop: '2px solid rgba(0,0,0,0.1)', textTransform: 'uppercase', letterSpacing: '1px' }}>
-            {calc.isSafe ? "✅ Steel provided OK" : "⚠️ Provide more steel"}
-          </div>
-        </div>
-
-        {/* BUTTONS */}
-        <div className="no-print" style={{ display: 'flex', gap: '12px', marginTop: '5px' }}>
-          <button onClick={() => window.print()} style={{ flex: 1, padding: '15px', backgroundColor: '#333', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 'bold', cursor: 'pointer', fontSize: '14px', boxShadow: '0 4px 6px rgba(0,0,0,0.1)' }}>
-            PRINT TO PDF
-          </button>
-          <button onClick={handleShare} style={{ flex: 1, padding: '15px', backgroundColor: '#25D366', color: '#fff', border: 'none', borderRadius: '8px', fontWeight: 'bold', cursor: 'pointer', fontSize: '14px', boxShadow: '0 4px 6px rgba(0,0,0,0.1)' }}>
-            SHARE REPORT
-          </button>
-        </div>
-
-      </div>
-    </div>
-  );
+  return points;
 }
